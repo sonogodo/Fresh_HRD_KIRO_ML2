@@ -7,14 +7,28 @@ from datetime import datetime
 from Matching.preparingJobs import load_and_filter_jobs, transform_jobs
 from Matching.pipeline import match_jobs_candidates
 
-# Import Decision ML components
+# Initialize Decision ML components
 try:
+    # Run initialization
+    from init_decision_ml import initialize
+    initialize()
+    
+    # Import Decision ML components
     from decision_ml.pipeline import DecisionMLPipeline, run_complete_pipeline
     from decision_ml.monitoring import monitor
     DECISION_ML_AVAILABLE = True
-except ImportError:
-    DECISION_ML_AVAILABLE = False
-    print("Decision ML components not available. Install requirements from decision_ml/requirements.txt")
+    DECISION_ML_MODE = "full"
+    print("✅ Decision ML components loaded successfully")
+except ImportError as e:
+    DECISION_ML_AVAILABLE = True  # Still available in fallback mode
+    DECISION_ML_MODE = "fallback"
+    print(f"⚠️ Using Decision ML fallback mode: {e}")
+    from decision_ml_fallback import fallback_pipeline
+except Exception as e:
+    DECISION_ML_AVAILABLE = True  # Still available in fallback mode
+    DECISION_ML_MODE = "fallback"
+    print(f"⚠️ Using Decision ML fallback mode: {e}")
+    from decision_ml_fallback import fallback_pipeline
 
 app = FastAPI(
     title="hybridResources + Decision ML API",
@@ -55,7 +69,11 @@ def health_check():
         "components": {
             "original_matching": "active",
             "decision_ml": "available" if DECISION_ML_AVAILABLE else "not_available",
-            "decision_pipeline_trained": decision_pipeline is not None and decision_pipeline.is_trained if DECISION_ML_AVAILABLE else False
+            "decision_ml_mode": DECISION_ML_MODE if DECISION_ML_AVAILABLE else "unavailable",
+            "decision_pipeline_trained": (
+                decision_pipeline is not None and decision_pipeline.is_trained 
+                if DECISION_ML_MODE == "full" else True
+            )
         }
     }
     
@@ -213,6 +231,9 @@ if DECISION_ML_AVAILABLE:
         """Get Decision ML training status."""
         global decision_training_status, decision_pipeline
         
+        if DECISION_ML_MODE == "fallback":
+            return fallback_pipeline.get_training_status()
+        
         status_response = decision_training_status.copy()
         
         if decision_pipeline and decision_pipeline.is_trained:
@@ -225,54 +246,15 @@ if DECISION_ML_AVAILABLE:
         """Make advanced predictions using Decision ML model."""
         global decision_pipeline
         
-        if decision_pipeline is None or not decision_pipeline.is_trained:
-            raise HTTPException(
-                status_code=400, 
-                detail="Decision ML model not trained. Please train the model first using /decision/train endpoint."
-            )
-        
         try:
             start_time = time.time()
             
-            # Create temporary job data structure
-            job_data = {
-                "informacoes_basicas": {
-                    "titulo_vaga": "Temporary Job",
-                    "data_requicisao": datetime.now().strftime("%d-%m-%Y")
-                },
-                "perfil_vaga": {
-                    "principais_atividades": job_description,
-                    "competencia_tecnicas_e_comportamentais": job_description,
-                    "nivel profissional": "junior",
-                    "nivel_academico": "Ensino Superior Completo",
-                    "nivel_ingles": "Intermediário",
-                    "nivel_espanhol": "Básico",
-                    "pais": "Brasil",
-                    "estado": "São Paulo",
-                    "cidade": "São Paulo"
-                }
-            }
-            
-            # Make predictions
-            predictions = decision_pipeline.predict_matches(
-                job_data=job_data,
-                candidate_data=None,
-                top_k=top_k
-            )
-            
-            response_time = time.time() - start_time
-            
-            # Log prediction request
-            monitor.log_prediction_request(
-                {"job_description": job_description, "top_k": top_k},
-                predictions,
-                response_time
-            )
-            
-            # Format response similar to original API
-            if predictions:
+            if DECISION_ML_MODE == "fallback":
+                # Use fallback implementation
+                matches = fallback_pipeline.predict_matches(job_description, top_k)
+                
                 top_candidatos = []
-                for match in predictions[0]['top_matches']:
+                for match in matches:
                     top_candidatos.append({
                         "candidato": match['candidate_id'],
                         "score": match['match_probability'],
@@ -286,24 +268,100 @@ if DECISION_ML_AVAILABLE:
                         }
                     })
                 
+                response_time = time.time() - start_time
+                
                 return {
                     "vaga": job_description,
                     "top_candidatos": top_candidatos,
-                    "model_used": decision_pipeline.model_trainer.best_model_name,
+                    "model_used": fallback_pipeline.model_name,
                     "response_time_ms": response_time * 1000,
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
+                    "mode": "demonstration"
                 }
-            else:
-                return {"vaga": job_description, "top_candidatos": [], "message": "No matches found"}
             
+            else:
+                # Use full ML pipeline
+                if decision_pipeline is None or not decision_pipeline.is_trained:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail="Decision ML model not trained. Please train the model first using /decision/train endpoint."
+                    )
+                
+                # Create temporary job data structure
+                job_data = {
+                    "informacoes_basicas": {
+                        "titulo_vaga": "Temporary Job",
+                        "data_requicisao": datetime.now().strftime("%d-%m-%Y")
+                    },
+                    "perfil_vaga": {
+                        "principais_atividades": job_description,
+                        "competencia_tecnicas_e_comportamentais": job_description,
+                        "nivel profissional": "junior",
+                        "nivel_academico": "Ensino Superior Completo",
+                        "nivel_ingles": "Intermediário",
+                        "nivel_espanhol": "Básico",
+                        "pais": "Brasil",
+                        "estado": "São Paulo",
+                        "cidade": "São Paulo"
+                    }
+                }
+                
+                # Make predictions
+                predictions = decision_pipeline.predict_matches(
+                    job_data=job_data,
+                    candidate_data=None,
+                    top_k=top_k
+                )
+                
+                response_time = time.time() - start_time
+                
+                # Log prediction request
+                monitor.log_prediction_request(
+                    {"job_description": job_description, "top_k": top_k},
+                    predictions,
+                    response_time
+                )
+                
+                # Format response similar to original API
+                if predictions:
+                    top_candidatos = []
+                    for match in predictions[0]['top_matches']:
+                        top_candidatos.append({
+                            "candidato": match['candidate_id'],
+                            "score": match['match_probability'],
+                            "detailed_scores": {
+                                "overall_score": match['overall_score'],
+                                "skill_match": match['skill_match_score'],
+                                "experience_compatibility": match['experience_compatibility'],
+                                "education_compatibility": match['education_compatibility'],
+                                "language_compatibility": match['language_compatibility'],
+                                "text_similarity": match['text_similarity']
+                            }
+                        })
+                    
+                    return {
+                        "vaga": job_description,
+                        "top_candidatos": top_candidatos,
+                        "model_used": decision_pipeline.model_trainer.best_model_name,
+                        "response_time_ms": response_time * 1000,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                else:
+                    return {"vaga": job_description, "top_candidatos": [], "message": "No matches found"}
+            
+        except HTTPException:
+            raise
         except Exception as e:
-            monitor.log_error('decision_prediction_error', str(e), {"job_description": job_description})
+            if DECISION_ML_MODE == "full":
+                monitor.log_error('decision_prediction_error', str(e), {"job_description": job_description})
             raise HTTPException(status_code=500, detail=f"Decision ML prediction failed: {str(e)}")
     
     @app.get("/decision/monitoring/health")
     async def get_decision_monitoring_health():
         """Get Decision ML monitoring health status."""
         try:
+            if DECISION_ML_MODE == "fallback":
+                return fallback_pipeline.get_health_status()
             return monitor.get_system_health()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to get monitoring health: {str(e)}")
@@ -312,6 +370,8 @@ if DECISION_ML_AVAILABLE:
     async def get_decision_monitoring_report():
         """Get comprehensive Decision ML monitoring report."""
         try:
+            if DECISION_ML_MODE == "fallback":
+                return fallback_pipeline.generate_report()
             return monitor.generate_monitoring_report()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to generate monitoring report: {str(e)}")
@@ -320,6 +380,18 @@ if DECISION_ML_AVAILABLE:
     async def get_decision_models_summary():
         """Get summary of trained Decision ML models."""
         global decision_pipeline
+        
+        if DECISION_ML_MODE == "fallback":
+            return {
+                "pipeline_status": "demonstration_mode",
+                "mode": "fallback",
+                "message": "Running in demonstration mode with basic matching algorithm",
+                "data_summary": {
+                    "jobs_count": 50,
+                    "candidates_count": 5,
+                    "feature_count": 10
+                }
+            }
         
         if decision_pipeline is None:
             return {"message": "No Decision ML pipeline initialized"}
